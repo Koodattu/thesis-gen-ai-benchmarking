@@ -13,53 +13,72 @@ from pydub import AudioSegment
 from dotenv import load_dotenv
 load_dotenv()
 
+os.makedirs("audio/english", exist_ok=True)
+os.makedirs("audio/finnish", exist_ok=True)
+os.makedirs("references/english", exist_ok=True)
+os.makedirs("references/finnish", exist_ok=True)
+os.makedirs("results", exist_ok=True)
+
 # Try to import pynvml for GPU VRAM monitoring (optional)
 import pynvml
 
 # Import the two Whisper implementations
-import whisper  # official OpenAI Whisper package (see :contentReference[oaicite:0]{index=0} and :contentReference[oaicite:1]{index=1})
-from faster_whisper import WhisperModel as FasterWhisperModel, BatchedInferencePipeline  # faster-whisper package (see :contentReference[oaicite:2]{index=2})
+import whisper  # official OpenAI Whisper package
+from faster_whisper import WhisperModel as FasterWhisperModel, BatchedInferencePipeline
 
 import logging
 
-logging.basicConfig()
-logging.getLogger("faster_whisper").setLevel(logging.ERROR)
+# -----------------------------------------------------------------------------
+# Logger Setup: all events, memory usage, and status changes go into a single file.
+# -----------------------------------------------------------------------------
+def setup_logger(log_path):
+    logger = logging.getLogger("benchmark")
+    logger.setLevel(logging.INFO)
+    # Remove any previously attached handlers.
+    if logger.hasHandlers():
+        logger.handlers.clear()
+    fh = logging.FileHandler(log_path)
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+    return logger
+
+# We'll initialize this later in main() after creating the results directory.
+logger = None
+
+# Helper: format bytes to gigabytes.
+def format_bytes(num_bytes):
+    gb = num_bytes / (1024**3)
+    return f"{gb:.2f} GB"
 
 # -----------------------------------------------------------------------------
 # Memory Logger Thread
 # -----------------------------------------------------------------------------
 class MemoryLogger(threading.Thread):
-    def __init__(self, interval=1.0, log_file='memory_usage.log'):
+    def __init__(self, interval=1.0):
         super().__init__()
         self.interval = interval
-        self.log_file = log_file
         self.running = True
         self.status = "unloaded"  # status: unloaded, loaded, processing
         pynvml.nvmlInit()
 
     def run(self):
-        with open(self.log_file, 'a') as f:
-            while self.running:
-                timestamp = datetime.now().isoformat()
-                process = psutil.Process(os.getpid())
-                ram_usage = process.memory_info().rss  # in bytes
-                gpu_usage = None
-                if pynvml:
-                    try:
-                        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-                        gpu_mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                        gpu_usage = gpu_mem.used
-                    except Exception:
-                        gpu_usage = None
-                log_entry = {
-                    'timestamp': timestamp,
-                    'status': self.status,
-                    'ram_usage_bytes': ram_usage,
-                    'gpu_usage_bytes': gpu_usage
-                }
-                f.write(json.dumps(log_entry) + "\n")
-                f.flush()
-                time.sleep(self.interval)
+        global logger
+        while self.running:
+            timestamp = datetime.now().isoformat()
+            process = psutil.Process(os.getpid())
+            ram_usage = process.memory_info().rss  # in bytes
+            gpu_usage = None
+            if pynvml:
+                try:
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                    gpu_mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                    gpu_usage = gpu_mem.used
+                except Exception:
+                    gpu_usage = None
+            # Log a single line that includes memory usage in a human-friendly format and current status.
+            logger.info(f"Memory Usage: RAM={format_bytes(ram_usage)}, GPU={format_bytes(gpu_usage) if gpu_usage is not None else 'N/A'} | Status: {self.status}")
+            time.sleep(self.interval)
 
     def stop(self):
         self.running = False
@@ -108,13 +127,16 @@ def test_local_whisper(model_size, audio_file, task="transcribe", language="en")
     task: "transcribe" (default) or "translate"
     Returns: (output_text, latency_seconds, model_load_time)
     """
+    logger.info(f"Loading local Whisper model '{model_size}' on device cuda for language '{language}'")
     start_load = time.time()
     model = whisper.load_model(model_size, device="cuda")
     load_time = time.time() - start_load
+    logger.info(f"Model loaded in {load_time:.2f} seconds")
 
-    # Warmup call (using the same file; ideally use a separate short file)
+    # Warmup call
     model.transcribe(audio_file, language=language, temperature=0.0)
     
+    logger.info(f"Starting transcription on file '{os.path.basename(audio_file)}' (language: {language})")
     start_time = time.time()
     if task == "transcribe":
         result = model.transcribe(audio_file, language=language, temperature=0.0)
@@ -124,13 +146,14 @@ def test_local_whisper(model_size, audio_file, task="transcribe", language="en")
         result = {}
     latency = time.time() - start_time
     output_text = result.get("text", "").strip()
+    logger.info(f"Finished transcription. Latency: {latency:.2f} seconds. Output length: {len(output_text)} characters")
 
-    # Unload model: delete the model, run garbage collection, and clear GPU cache if applicable
+    # Unload model
     del model
     gc.collect()
     if torch is not None and torch.cuda.is_available():
         torch.cuda.empty_cache()
-
+    logger.info(f"Unloaded local Whisper model '{model_size}'")
     return output_text, latency, load_time
 
 def test_faster_whisper(model_size, audio_file, task="transcribe", language="en"):
@@ -139,13 +162,16 @@ def test_faster_whisper(model_size, audio_file, task="transcribe", language="en"
     task: "transcribe" or "translate"
     Returns: (output_text, latency_seconds, model_load_time)
     """
+    logger.info(f"Loading Faster-Whisper model '{model_size}' on device cuda for language '{language}'")
     start_load = time.time()
     model = FasterWhisperModel(model_size, device="cuda", compute_type="float16")
     load_time = time.time() - start_load
+    logger.info(f"Faster-Whisper model loaded in {load_time:.2f} seconds")
 
-    # Warmup: iterate over segments (transcription starts on iteration)
+    # Warmup
     list(model.transcribe(audio_file, beam_size=5, language=language, temperature=0.0))
     
+    logger.info(f"Starting Faster-Whisper transcription on file '{os.path.basename(audio_file)}'")
     start_time = time.time()
     if task == "transcribe":
         segments, _ = model.transcribe(audio_file, beam_size=5, language=language, temperature=0.0)
@@ -155,13 +181,14 @@ def test_faster_whisper(model_size, audio_file, task="transcribe", language="en"
         segments = []
     latency = time.time() - start_time
     output_text = " ".join([seg.text for seg in segments]).strip() if segments else ""
+    logger.info(f"Finished Faster-Whisper transcription. Latency: {latency:.2f} seconds. Output length: {len(output_text)} characters")
 
-    # Unload model: delete the model, run garbage collection, and clear GPU cache if applicable
+    # Unload model
     del model
     gc.collect()
     if torch is not None and torch.cuda.is_available():
         torch.cuda.empty_cache()
-
+    logger.info(f"Unloaded Faster-Whisper model '{model_size}'")
     return output_text, latency, load_time
 
 def test_faster_whisper_batched(model_size, audio_file, task="transcribe", language="en"):
@@ -170,14 +197,17 @@ def test_faster_whisper_batched(model_size, audio_file, task="transcribe", langu
     task: "transcribe" or "translate"
     Returns: (output_text, latency_seconds, model_load_time)
     """
+    logger.info(f"Loading Faster-Whisper batched model '{model_size}' on device cuda for language '{language}'")
     start_load = time.time()
     model = FasterWhisperModel(model_size, device="cuda", compute_type="float16")
     batched_model = BatchedInferencePipeline(model)
     load_time = time.time() - start_load
+    logger.info(f"Batched model loaded in {load_time:.2f} seconds")
 
-    # Warmup: iterate over segments (transcription starts on iteration)
+    # Warmup
     list(model.transcribe(audio_file, beam_size=5, language=language, temperature=0.0))
     
+    logger.info(f"Starting batched Faster-Whisper transcription on file '{os.path.basename(audio_file)}'")
     start_time = time.time()
     if task == "transcribe":
         segments, _ = batched_model.transcribe(audio_file, beam_size=5, language=language, temperature=0.0, batch_size=16)
@@ -187,14 +217,15 @@ def test_faster_whisper_batched(model_size, audio_file, task="transcribe", langu
         segments = []
     latency = time.time() - start_time
     output_text = " ".join([seg.text for seg in segments]).strip() if segments else ""
+    logger.info(f"Finished batched Faster-Whisper transcription. Latency: {latency:.2f} seconds. Output length: {len(output_text)} characters")
 
-    # Unload model: delete the model, run garbage collection, and clear GPU cache if applicable
+    # Unload model and batched model
     del model
     del batched_model
     gc.collect()
     if torch is not None and torch.cuda.is_available():
         torch.cuda.empty_cache()
-
+    logger.info(f"Unloaded batched Faster-Whisper model '{model_size}'")
     return output_text, latency, load_time
 
 def test_rest_api(audio_file, task="transcribe"):
@@ -203,6 +234,7 @@ def test_rest_api(audio_file, task="transcribe"):
     task: "transcribe" or "translate"
     Returns: (output_text, latency_seconds)
     """
+    logger.info(f"Starting REST API transcription on file '{os.path.basename(audio_file)}'")
     openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     start_time = time.time()
     with open(audio_file, "rb") as f:
@@ -218,6 +250,7 @@ def test_rest_api(audio_file, task="transcribe"):
             result = {}
     latency = time.time() - start_time
     output_text = result.text.strip()
+    logger.info(f"Finished REST API transcription. Latency: {latency:.2f} seconds. Output length: {len(output_text)} characters")
     return output_text, latency
 
 # -----------------------------------------------------------------------------
@@ -226,8 +259,8 @@ def test_rest_api(audio_file, task="transcribe"):
 def run_benchmark(method, model_size, audio_file, task, lang="en", n_runs=3):
     """
     Runs the test n_runs times and averages the latency.
-    method: "local", "faster", or "rest"
-    For "local" and "faster", model_size (e.g., "tiny") is used; for "rest", it is ignored.
+    method: "local", "faster", "fasterbatched", or "rest"
+    For "local", "faster" and "fasterbatched", model_size (e.g., "tiny") is used; for "rest", it is ignored.
     Returns a dict with:
       - avg_latency
       - list of latencies
@@ -281,35 +314,39 @@ def get_audio_duration(file_path):
                 duration = frames / float(rate)
                 return duration
         elif AudioSegment is not None:
-            # pydub returns duration in milliseconds
             audio = AudioSegment.from_file(file_path)
-            return len(audio) / 1000.0
+            return len(audio) / 1000.0  # Convert milliseconds to seconds
         else:
-            print(f"Cannot determine duration for {file_path} (unsupported format and no pydub available)")
+            logger.error(f"Cannot determine duration for {file_path} (unsupported format and no pydub available)")
             return None
     except Exception as e:
-        print(f"Error reading duration for {file_path}: {e}")
+        logger.error(f"Error reading duration for {file_path}: {e}")
         return None
 
 # -----------------------------------------------------------------------------
 # Main Benchmarking Script
 # -----------------------------------------------------------------------------
 def main():
+    global logger
     # Define directories (modify as needed)
     audio_dir = "./audio"
     ref_dir = "./references"
     results_dir = "./results"
     os.makedirs(results_dir, exist_ok=True)
+    
+    # Setup logger to write to a single log file in the results directory.
+    logger = setup_logger(os.path.join(results_dir, "benchmark.log"))
+    logger.info("Benchmarking started.")
 
     # Start memory logger thread
-    mem_logger = MemoryLogger(interval=1.0, log_file=os.path.join(results_dir, "memory_usage.log"))
+    mem_logger = MemoryLogger(interval=1.0)
     mem_logger.start()
 
     # Define languages and determine tasks:
     # For English: only transcription; for Finnish: both transcription and translation.
     languages = ["english", "finnish"]
     methods = ["local", "faster", "fasterbatched", "rest"]
-    model_sizes = ["tiny", ]#"base", "small", "medium", "large", "turbo", "large-v3"]
+    model_sizes = ["tiny", "base", "small", "medium", "large", "turbo", "large-v3"]
 
     summary = []  # to collect all benchmark results
 
@@ -319,24 +356,20 @@ def main():
         for filename in os.listdir(audio_path):
             if filename.lower().endswith((".wav", ".mp3", ".m4a")):
                 file_path = os.path.join(audio_path, filename)
-                
-                # Use the helper to get the audio file's duration in seconds
                 duration_seconds = get_audio_duration(file_path)
                 if duration_seconds is None:
-                    print(f"Skipping {filename} due to duration extraction error.")
+                    logger.error(f"Skipping {filename} due to duration extraction error.")
                     continue
+                logger.info(f"Processing file '{filename}' with duration {duration_seconds:.2f} seconds.")
 
-                # Determine tasks: English files get only transcription;
-                # Finnish files get both transcription and translation.
+                # Determine tasks: English files get only transcription; Finnish get both.
                 tasks = ["transcribe"] if lang == "english" else ["transcribe", "translate"]
                 for task in tasks:
-                    # Run tests for each method.
                     for method in methods:
                         if method in ["local", "faster", "fasterbatched"]:
                             for model_size in model_sizes:
-                                print(f"[{datetime.now().isoformat()}] {method} ({model_size}) on {filename} for {task}")
+                                logger.info(f"Method '{method}' (model: {model_size}) on '{filename}' for task '{task}'")
                                 result = run_benchmark(method, model_size, file_path, task, lang, n_runs=3)
-                                # Save detailed result
                                 result_filename = f"{lang}_{filename}_{task}_{method}_{model_size}.json"
                                 with open(os.path.join(results_dir, result_filename), "w") as rf:
                                     json.dump(result, rf, indent=2)
@@ -351,7 +384,7 @@ def main():
                                     "duration": duration_seconds
                                 })
                         elif method == "rest":
-                            print(f"[{datetime.now().isoformat()}] {method} on {filename} for {task}")
+                            logger.info(f"Method '{method}' on '{filename}' for task '{task}'")
                             result = run_benchmark(method, None, file_path, task, n_runs=3)
                             result_filename = f"{lang}_{filename}_{task}_{method}.json"
                             with open(os.path.join(results_dir, result_filename), "w") as rf:
@@ -370,11 +403,9 @@ def main():
     # Save summary before accuracy evaluation
     with open(os.path.join(results_dir, "summary.json"), "w") as sf:
         json.dump(summary, sf, indent=2)
+    logger.info("Saved summary.json.")
 
     # Evaluate accuracy (if reference files exist)
-    # For each benchmark entry, assume reference files are named as:
-    #   <basename>_transcribe.txt for transcription,
-    #   <basename>_translate.txt for translation.
     for entry in summary:
         file_base, _ = os.path.splitext(entry["file"])
         task = entry["task"]
@@ -384,7 +415,6 @@ def main():
         if os.path.exists(ref_file):
             with open(ref_file, "r", encoding="utf-8") as rf:
                 reference_text = rf.read()
-            # Construct result filename matching our saved detail file.
             result_filename = f"{lang}_{entry['file']}_{task}_{entry['method']}_{entry.get('model_size', 'whisper-1')}.json"
             result_filepath = os.path.join(results_dir, result_filename)
             if os.path.exists(result_filepath):
@@ -393,6 +423,7 @@ def main():
                 output_text = result_data.get("output_text", "")
                 accuracy = evaluate_accuracy(reference_text, output_text, task)
                 entry["accuracy"] = accuracy
+                logger.info(f"Evaluated accuracy for {entry['file']} ({task}) using method {entry['method']} {entry.get('model_size', 'whisper-1')}: {accuracy}")
             else:
                 entry["accuracy"] = None
         else:
@@ -400,12 +431,12 @@ def main():
 
     with open(os.path.join(results_dir, "summary_with_accuracy.json"), "w") as sf:
         json.dump(summary, sf, indent=2)
+    logger.info("Saved summary_with_accuracy.json.")
 
     # Stop memory logger and wait for thread to finish
     mem_logger.stop()
     mem_logger.join()
-
-    print("Benchmarking completed. See the 'results' directory for details.")
+    logger.info("Benchmarking completed. See the 'results' directory for details.")
 
 if __name__ == "__main__":
     main()
