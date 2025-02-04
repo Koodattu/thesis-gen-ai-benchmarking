@@ -1,0 +1,9 @@
+openai-whisper
+faster-whisper
+openai
+psutil
+pynvml
+torch==2.5.1+cu118 --index-url https://download.pytorch.org/whl/cu118
+torchaudio==2.5.1+cu118 --index-url https://download.pytorch.org/whl/cu118
+python-dotenv
+pydub
