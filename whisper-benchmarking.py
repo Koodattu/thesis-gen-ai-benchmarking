@@ -37,10 +37,17 @@ def setup_logger(log_path):
     # Remove any previously attached handlers.
     if logger.hasHandlers():
         logger.handlers.clear()
+    # File handler writes to the log file.
     fh = logging.FileHandler(log_path)
+    fh.setLevel(logging.INFO)
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
     fh.setFormatter(formatter)
     logger.addHandler(fh)
+    # Stream handler writes to the console.
+    sh = logging.StreamHandler()
+    sh.setLevel(logging.INFO)
+    sh.setFormatter(formatter)
+    logger.addHandler(sh)
     return logger
 
 # We'll initialize this later in main() after creating the results directory.
@@ -386,7 +393,7 @@ def main():
                         elif method == "rest":
                             logger.info(f"Method '{method}' on '{filename}' for task '{task}'")
                             result = run_benchmark(method, None, file_path, task, n_runs=3)
-                            result_filename = f"{lang}_{filename}_{task}_{method}.json"
+                            result_filename = f"{lang}_{filename}_{task}_{method}_whisper-1.json"
                             with open(os.path.join(results_dir, result_filename), "w") as rf:
                                 json.dump(result, rf, indent=2)
                             summary.append({
